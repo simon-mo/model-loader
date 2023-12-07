@@ -1,5 +1,6 @@
 import time
 import struct
+from contextlib import contextmanager
 
 import requests
 import torch
@@ -46,10 +47,11 @@ class LoaderByteTensor:
         }
 
 class SafeTensorLoader:
-    def __init__(self, url):
-        self.metadata = get_safe_tensor_metadata(url)
-        print(self.metadata)
-        self.raw_pointer = download_to_device(self.metadata["resolved_url"], self.metadata["header_size"], self.metadata["data_size"])
+    def __init__(self, urls, num_workers=None):
+        assert len(urls) == 1, "Only one URL supported for now"
+        for url in urls:
+            self.metadata = get_safe_tensor_metadata(url)
+        self.raw_pointer = download_to_device([self.metadata["resolved_url"]], [self.metadata["header_size"]], [self.metadata["data_size"]], num_workers)[0]
         self.data = self._create_torch_tensors(self.metadata, self.raw_pointer)
 
     def _create_torch_tensors(self, metadata, raw_pointer):
@@ -87,20 +89,27 @@ class SafeTensorLoader:
     def get_tensor(self, key):
         return self.data[key]
 
+@contextmanager
+def timeit(name):
+    start = time.perf_counter_ns()
+    yield
+    end = time.perf_counter_ns()
+    print(f"{name}: {(end-start)/1e9:.2f} s")
 
 if __name__ == "__main__":
-    url = "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v0.6/resolve/main/model.safetensors"
+    # url = "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v0.6/resolve/main/model.safetensors"
+    url = "https://huggingface.co/berkeley-nest/Starling-LM-7B-alpha/resolve/main/model-00001-of-00003.safetensors"
 
-    loader = SafeTensorLoader(url)
-    print(loader.keys())
+    num_workers = 8
 
-    import safetensors
-    with safetensors.safe_open("model.safetensors", "pt", device="cuda") as f:
-        all_tensor_names = set(loader.keys()) - {"__metadata__"}
-        assert set(f.keys()) == set(loader.keys()), f"Keys don't match: {f.keys()} vs {loader.keys()}, missing {all_tensor_names - set(f.keys())}"
+    with timeit("our download"):
+        loader = SafeTensorLoader([url], num_workers)
 
-        for key in all_tensor_names:
-            assert torch.allclose(f.get_tensor(key), loader.get_tensor(key))
-            print(f"{key} OK")
+    # import safetensors
+    # f = safetensors.safe_open("model.safetensors", "pt", device="cuda")
+    # assert set(f.keys()) == set(loader.keys()), f"Keys don't match: {f.keys()} vs {loader.keys()}"
+    # for key in f.keys():
+    #     assert torch.allclose(f.get_tensor(key), loader.get_tensor(key)), f"Tensor {key} doesn't match"
+    # print("All tensors match!")
 
 

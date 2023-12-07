@@ -1,11 +1,12 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
 use cudarc::driver::sys as cu;
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use pyo3::prelude::*;
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
-fn cuda_init() {
+fn cuda_init() -> cu::CUcontext {
     unsafe {
         let result = cu::cuInit(0);
         assert!(
@@ -29,6 +30,8 @@ fn cuda_init() {
             "context create failed: {:?}",
             context_result
         );
+
+        context
     }
 }
 
@@ -59,52 +62,98 @@ fn cuda_malloc_pair(size: usize) -> (*mut c_void, u64) {
     }
 }
 
-#[tokio::main]
 async fn download_url(
     url: &str,
+    num_workers: Option<usize>,
     header_size: usize,
-    mut host_ptr: *mut c_void,
+    data_size: usize,
+    host_ptr: usize,
 ) -> Result<(), reqwest::Error> {
-    let range_header = format!("bytes={}-", header_size);
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header("Range", range_header)
-        .send()
-        .await?;
+    let num_workers = num_workers.unwrap_or(num_cpus::get());
 
-    let bar = ProgressBar::new(resp.content_length().unwrap());
+    let bar = ProgressBar::new(data_size as u64);
+    let sty = ProgressStyle::with_template("{spinner:.green} ({msg}) [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes:>12}/{total_bytes:>12} ({bytes_per_sec:>15}, {eta:>5})")
+        .unwrap()
+        .progress_chars("#>-");
+    bar.set_style(sty);
+    let arc_bar = Arc::new(bar);
 
-    let mut stream = resp.bytes_stream();
-    while let Some(item) = stream.next().await {
-        let bytes = item?;
+    let mut tasks = JoinSet::new();
+    let per_worker_size = data_size / num_workers;
+    for i in 0..num_workers {
+        let arc_bar = arc_bar.clone();
+        let url = url.to_owned();
+        tasks.spawn(async move {
+            // let range_header = format!("bytes={}-", header_size);
+            let range_start = header_size + i * per_worker_size;
+            let range_header = {
+                if i == num_workers - 1 {
+                    format!("bytes={}-", range_start)
+                } else {
+                    format!("bytes={}-{}", range_start, range_start + per_worker_size)
+                }
+            };
 
-        bar.inc(bytes.len() as u64);
+            let resp = reqwest::Client::new()
+                .get(url)
+                .header("Range", range_header)
+                .send()
+                .await?;
 
-        // write to the ptr
-        unsafe {
-            std::ptr::copy(bytes.as_ptr(), host_ptr as *mut u8, bytes.len());
+            let mut stream = resp.bytes_stream();
+            let mut host_ptr = host_ptr + i * per_worker_size;
+            while let Some(item) = stream.next().await {
+                let bytes = item?;
+
+                arc_bar.inc(bytes.len() as u64);
+
+                unsafe {
+                    std::ptr::copy(bytes.as_ptr(), host_ptr as *mut u8, bytes.len());
+                    host_ptr += bytes.len();
+                }
+            }
+
+            Ok(())
+        });
+    }
+
+    while let Some(res) = tasks.join_next().await {
+        let res = res.unwrap();
+        if res.is_err() {
+            return res;
         }
-
-        // advance the ptr
-        host_ptr = unsafe {
-            let host_ptr = host_ptr as *mut u8;
-            let host_ptr = host_ptr.add(bytes.len());
-            host_ptr as *mut c_void
-        };
     }
 
     Ok(())
 }
 
-#[pyfunction]
-fn download_to_device(url: &str, header_size: usize, data_size: usize) -> PyResult<usize> {
-    cuda_init();
+async fn alloc_and_download(
+    cu_ctx_addr: usize,
+    url: &str,
+    num_workers: Option<usize>,
+    header_size: usize,
+    data_size: usize,
+) -> Result<u64, reqwest::Error> {
+    // set context for current thread
+    unsafe {
+        let cu_ctx = cu_ctx_addr as cu::CUcontext;
+        cu::cuCtxSetCurrent(cu_ctx);
+    }
 
     let (host_ptr, device_ptr) = cuda_malloc_pair(data_size);
+    let host_ptr = host_ptr as usize; // casting so it is cheaply copyable
 
-    download_url(url, header_size, host_ptr).unwrap();
+    download_url(url, num_workers, header_size, data_size, host_ptr).await?;
 
     // copy from host to device
+    // there's about 100ms per 1GB of data overhead here. This can entirely go away by
+    // using async copy and run it along side with the download. We probably need it for
+    // 7B model.
+    unsafe {
+        let cu_ctx = cu_ctx_addr as cu::CUcontext;
+        cu::cuCtxSetCurrent(cu_ctx);
+    }
+    let start = std::time::Instant::now();
     unsafe {
         let copy_result = cu::cuMemcpyHtoD_v2(device_ptr, host_ptr as *mut c_void, data_size);
         assert!(
@@ -113,8 +162,41 @@ fn download_to_device(url: &str, header_size: usize, data_size: usize) -> PyResu
             copy_result
         );
     }
+    println!("copy took {:?}", start.elapsed());
 
-    Ok(device_ptr as usize)
+    Ok(device_ptr)
+}
+
+#[pyfunction]
+fn download_to_device(
+    urls: Vec<&str>,
+    header_size: Vec<usize>,
+    data_size: Vec<usize>,
+    num_workers: Option<usize>,
+) -> PyResult<Vec<u64>> {
+    let cu_ctx = cuda_init();
+    let cu_ctx_addr = cu_ctx as usize;
+
+    assert!(urls.len() == header_size.len());
+    assert!(urls.len() == data_size.len());
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut tasks = JoinSet::new();
+        for ((url, header_size), data_size) in urls.into_iter().zip(header_size).zip(data_size) {
+            let url = url.to_owned();
+            tasks.spawn(async move {
+                alloc_and_download(cu_ctx_addr, &url, num_workers, header_size, data_size).await
+            });
+        }
+
+        let mut device_ptrs = Vec::new();
+        while let Some(res) = tasks.join_next().await {
+            let res = res.unwrap().unwrap();
+            device_ptrs.push(res);
+        }
+
+        Ok(device_ptrs)
+    })
 }
 
 /// A Python module implemented in Rust.

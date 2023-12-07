@@ -505,6 +505,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc",
  "indicatif",
+ "num_cpus",
  "pyo3",
  "reqwest",
  "tokio",
