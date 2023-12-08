@@ -228,11 +228,24 @@ fn zip_list_range(host_ptr: u64, file_size: usize) -> PyResult<Vec<(String, u64,
     Ok(name_ranges)
 }
 
+#[pyfunction]
+fn free_host_ptr(host_ptr: u64) {
+    unsafe {
+        let free_result = cu::cuMemFreeHost(host_ptr as *mut c_void);
+        assert!(
+            free_result == cu::cudaError_enum::CUDA_SUCCESS,
+            "free failed: {:?}",
+            free_result
+        );
+    }
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn model_loader(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_to_device, m)?)?;
     m.add_function(wrap_pyfunction!(zip_extract, m)?)?;
     m.add_function(wrap_pyfunction!(zip_list_range, m)?)?;
+    m.add_function(wrap_pyfunction!(free_host_ptr, m)?)?;
     Ok(())
 }
