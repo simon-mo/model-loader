@@ -1,11 +1,15 @@
 import time
+import io
+import pickle
 import struct
+import tempfile
+import os
 from contextlib import contextmanager
 
 import requests
 import torch
 
-from model_loader import download_to_device
+from model_loader import download_to_device, zip_extract, zip_list_range
 
 def get_safe_tensor_metadata(url):
     # resolve any redirect
@@ -51,7 +55,7 @@ class SafeTensorLoader:
         assert len(urls) == 1, "Only one URL supported for now"
         for url in urls:
             self.metadata = get_safe_tensor_metadata(url)
-        self.raw_pointer = download_to_device([self.metadata["resolved_url"]], [self.metadata["header_size"]], [self.metadata["data_size"]], num_workers)[0]
+        _, self.raw_pointer = download_to_device([self.metadata["resolved_url"]], [self.metadata["header_size"]], [self.metadata["data_size"]], num_workers)[0]
         self.data = self._create_torch_tensors(self.metadata, self.raw_pointer)
 
     def _create_torch_tensors(self, metadata, raw_pointer):
@@ -89,6 +93,77 @@ class SafeTensorLoader:
     def get_tensor(self, key):
         return self.data[key]
 
+class _TorchUnpickler(pickle.Unpickler):
+    def __init__(self, file):
+        super().__init__(file)
+        self.data_lookup = {}
+
+    def persistent_load(self, inp):
+        # print(inp)
+        typename, storage_cls, fn, device, nelements = inp
+        assert typename == "storage"
+        size_per_element = {
+            torch.BFloat16Storage: 2,
+            torch.FloatStorage: 4,
+            torch.DoubleStorage: 8,
+        }[storage_cls]
+        dtype = {
+            torch.BFloat16Storage: torch.bfloat16,
+            torch.FloatStorage: torch.float,
+            torch.DoubleStorage: torch.double,
+        }[storage_cls]
+
+        # make an empty, shallow file to mmap
+        fd, fp = tempfile.mkstemp()
+        os.truncate(fd, nelements * size_per_element)
+
+        untyped_storage = torch.UntypedStorage.from_file(fp, shared=False, nbytes=nelements*size_per_element)
+        self.data_lookup[untyped_storage._cdata] = fn
+        return torch.storage.TypedStorage(
+            wrap_storage=untyped_storage, dtype=dtype
+        )
+
+class TorchCkptLoader:
+    def __init__(self, urls, num_workers=None):
+        assert len(urls) == 1, "Only one URL supported for now"
+        for url in urls:
+            resp = requests.head(url, allow_redirects=True)
+            data_size = int(resp.headers.get("Content-Length"))
+            self.metadata = {
+                "resolved_url": resp.url,
+                "header_size": 0,
+                "data_size": data_size,
+            }
+        host_ptr, device_ptr = download_to_device([self.metadata["resolved_url"]], [self.metadata["header_size"]], [self.metadata["data_size"]], num_workers)[0]
+
+        # TODO: some legacy models are not zipfile :(, maybe just do a fallback there.
+        data_pkl_raw = zip_extract(host_ptr, data_size, "pytorch_model/data.pkl")
+
+        fn_to_range = {fn: (offset, size) for (fn, offset, size) in zip_list_range(host_ptr, data_size)}
+
+        unpickler = _TorchUnpickler(io.BytesIO(data_pkl_raw))
+        loaded = unpickler.load()
+        self.data = {}
+        for k, shallow_tensor in loaded.items():
+            fn = unpickler.data_lookup[shallow_tensor.untyped_storage()._cdata]
+            offset, nbytes = fn_to_range[f"pytorch_model/data/{fn}"]
+
+            ptr = device_ptr+offset
+            our_tensor = LoaderByteTensor(ptr, nbytes=nbytes)
+            untyped_storage = torch.as_tensor(our_tensor, device=torch.device("cuda")).untyped_storage()
+            torch_tensor = torch.tensor(untyped_storage, device=torch.device("cuda"), dtype=shallow_tensor.dtype).view(shallow_tensor.shape)
+
+            self.data[k] = torch_tensor
+
+    def keys(self):
+        return self.data.keys()
+
+    def get_tensor(self, key):
+        return self.data[key]
+
+    def __getitem__(self, key):
+        return self.get_tensor(key)
+
 @contextmanager
 def timeit(name):
     start = time.perf_counter_ns()
@@ -98,12 +173,16 @@ def timeit(name):
 
 if __name__ == "__main__":
     # url = "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v0.6/resolve/main/model.safetensors"
-    url = "https://huggingface.co/berkeley-nest/Starling-LM-7B-alpha/resolve/main/model-00001-of-00003.safetensors"
+    # url = "https://huggingface.co/berkeley-nest/Starling-LM-7B-alpha/resolve/main/model-00001-of-00003.safetensors"
+    # url = "https://huggingface.co/gpt2/resolve/main/pytorch_model.bin"
+    url = "https://huggingface.co/Locutusque/TinyMistral-248M/resolve/main/pytorch_model.bin"
 
     num_workers = 8
 
     with timeit("our download"):
-        loader = SafeTensorLoader([url], num_workers)
+        # loader = SafeTensorLoader([url], num_workers)
+        loader = TorchCkptLoader([url], num_workers)
+
 
     # import safetensors
     # f = safetensors.safe_open("model.safetensors", "pt", device="cuda")
@@ -113,3 +192,8 @@ if __name__ == "__main__":
     # print("All tensors match!")
 
 
+    f = torch.load("pytorch_model.bin.1", map_location=torch.device("cuda"))
+    assert set(f.keys()) == set(loader.keys()), f"Keys don't match: {f.keys()} vs {loader.keys()}"
+    for key in f.keys():
+        assert torch.allclose(f[key], loader[key]), f"Tensor {key} doesn't match"
+    print("All tensors match!")

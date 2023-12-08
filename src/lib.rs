@@ -1,8 +1,10 @@
+use std::io::Read;
 use std::{ffi::c_void, sync::Arc};
 
 use cudarc::driver::sys as cu;
 use indicatif::{ProgressBar, ProgressStyle};
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
@@ -133,7 +135,7 @@ async fn alloc_and_download(
     num_workers: Option<usize>,
     header_size: usize,
     data_size: usize,
-) -> Result<u64, reqwest::Error> {
+) -> Result<(u64, u64), reqwest::Error> {
     // set context for current thread
     unsafe {
         let cu_ctx = cu_ctx_addr as cu::CUcontext;
@@ -164,7 +166,7 @@ async fn alloc_and_download(
     }
     println!("copy took {:?}", start.elapsed());
 
-    Ok(device_ptr)
+    Ok((host_ptr as u64, device_ptr))
 }
 
 #[pyfunction]
@@ -173,7 +175,7 @@ fn download_to_device(
     header_size: Vec<usize>,
     data_size: Vec<usize>,
     num_workers: Option<usize>,
-) -> PyResult<Vec<u64>> {
+) -> PyResult<Vec<(u64, u64)>> {
     let cu_ctx = cuda_init();
     let cu_ctx_addr = cu_ctx as usize;
 
@@ -189,19 +191,48 @@ fn download_to_device(
             });
         }
 
-        let mut device_ptrs = Vec::new();
+        let mut pair_ptrs = Vec::new();
         while let Some(res) = tasks.join_next().await {
             let res = res.unwrap().unwrap();
-            device_ptrs.push(res);
+            pair_ptrs.push(res);
         }
 
-        Ok(device_ptrs)
+        Ok(pair_ptrs)
     })
+}
+
+#[pyfunction]
+fn zip_extract(py: Python, host_ptr: u64, file_size: usize, file_name: &str) -> PyObject {
+    let vec = unsafe { Vec::from_raw_parts(host_ptr as *mut u8, file_size, 0) };
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(vec)).unwrap();
+    let mut file = archive.by_name(file_name).unwrap();
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).unwrap();
+    PyBytes::new(py, &buf).into()
+}
+
+#[pyfunction]
+fn zip_list_range(host_ptr: u64, file_size: usize) -> PyResult<Vec<(String, u64, u64)>> {
+    let vec = unsafe { Vec::from_raw_parts(host_ptr as *mut u8, file_size, 0) };
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(vec)).unwrap();
+    let mut name_ranges = Vec::new();
+    for i in 0..archive.len() {
+        let file = archive.by_index(i).unwrap();
+        assert!(
+            file.compression() == zip::CompressionMethod::Stored,
+            "file {} is compressed, which is not supported",
+            file.name()
+        );
+        name_ranges.push((file.name().to_owned(), file.data_start(), file.size()));
+    }
+    Ok(name_ranges)
 }
 
 /// A Python module implemented in Rust.
 #[pymodule]
 fn model_loader(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download_to_device, m)?)?;
+    m.add_function(wrap_pyfunction!(zip_extract, m)?)?;
+    m.add_function(wrap_pyfunction!(zip_list_range, m)?)?;
     Ok(())
 }
